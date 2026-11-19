@@ -1,0 +1,42 @@
+---Shared netchannels for CPF server-client communication
+---@class CPFNetChannels
+---@field RequestApplyPreset ExtenderNetChannel
+---@field RequestUserInfo ExtenderNetChannel
+---@field RequestDreamGuardians ExtenderNetChannel
+---@field IconUpdate ExtenderNetChannel
+NetChannels = {}
+
+---Creates and returns a netchannel with the given name
+---@param channelName string
+---@return ExtenderNetChannel
+local function createChannel(channelName)
+    ---@type ExtenderNetChannel
+    local channel = Ext.Net.CreateChannel(ModuleUUID, channelName)
+    return channel
+end
+
+---RequestApplyPreset channel for applying character presets
+---@class RequestApplyPresetChannel : ExtenderNetChannel
+NetChannels.RequestApplyPreset = createChannel("RequestApplyPreset")
+
+---RequestUserInfo channel for retrieving user information
+---@class RequestUserInfoChannel : ExtenderNetChannel
+NetChannels.RequestUserInfo = createChannel("RequestUserInfo")
+
+---RequestDreamGuardians channel for reading a player's Dream Guardians on the server
+---@class RequestDreamGuardiansChannel : ExtenderNetChannel
+NetChannels.RequestDreamGuardians = createChannel("RequestDreamGuardians")
+
+---ApplyCCAToClientDummy channel for applying CCA to client-side dummy
+---@class ApplyCCAToClientDummyChannel : ExtenderNetChannel
+NetChannels.ApplyCCAToClientDummy = createChannel("ApplyCCAToClientDummy")
+
+---IconUpdate channel for sending rendered portrait icons from client to server
+---@class IconUpdateChannel : ExtenderNetChannel
+NetChannels.IconUpdate = createChannel("IconUpdate")
+
+--- The host client's preset records, relayed by the server to every client
+---@class PresetCatalogChannel : ExtenderNetChannel
+NetChannels.PresetCatalog = createChannel("PresetCatalog")
+
+return NetChannels

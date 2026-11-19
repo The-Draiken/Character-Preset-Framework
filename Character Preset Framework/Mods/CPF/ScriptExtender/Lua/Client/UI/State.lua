@@ -1,0 +1,641 @@
+local rx = Ext.Require("Lib/reactivex/_init.lua")
+
+local STATUS_MESSAGE_TIMEOUT = 3000
+
+---@class CopySource
+---@field Name string Combo label and default preset name
+---@field Data PresetData? Nil for the controlled character, which is captured live
+
+---@class ApplyTarget
+---@field Name string Combo label
+---@field Target "Character"|"DreamGuardian"
+---@field GuardianUuid string? Dream Guardian entity outside Character Creation
+---@field Stats CCStats? Race/body of the Dream Guardian, for compatibility warnings
+
+local State = {
+    ViewMode = rx.BehaviorSubject.Create("VIEW"),
+    SelectedPreset = rx.BehaviorSubject.Create(nil),
+    Presets = rx.BehaviorSubject.Create({}),
+    StatusMessage = rx.BehaviorSubject.Create(""),
+    CapturedData = rx.BehaviorSubject.Create(nil),
+    TargetCharacterUUID = nil,
+    CopySources = rx.BehaviorSubject.Create({}),
+    SelectedCopySource = 1,
+    ---@type ApplyTarget[]
+    ApplyTargets = rx.BehaviorSubject.Create({}),
+    SelectedApplyTarget = 1,
+
+    -- Buffers
+    NewPresetData = rx.BehaviorSubject.Create({
+        Name = "",
+        Author = "",
+        Version = "1.0"
+    }),
+    ImportBuffer = rx.BehaviorSubject.Create(""),
+
+    _statusSubscription = nil
+}
+
+function State:GetStatusMessageDuration(msg)
+    local increase = #msg / 20 * 1000
+    return STATUS_MESSAGE_TIMEOUT + increase
+end
+
+-- Helper to set status
+function State:SetStatus(msg)
+    self.StatusMessage:OnNext(msg)
+
+    -- Auto-clear logic to avoid clearing new messages
+    if self._statusTimerHandle then
+        Ext.Timer.Cancel(self._statusTimerHandle)
+        self._statusTimerHandle = nil
+    end
+
+    if msg ~= "" then
+        -- Clear after STATUS_MESSAGE_TIMEOUT using Ext.Timer
+        self._statusTimerHandle = Ext.Timer.WaitFor(self:GetStatusMessageDuration(msg), function()
+            self._statusTimerHandle = nil
+            if self.StatusMessage:GetValue() == msg then
+                self.StatusMessage:OnNext("")
+            end
+        end)
+    end
+end
+
+-- REFACTOR: make this less brittle for changes to modes
+function State:SetMode(mode)
+    -- NOTE: there's a small bug causing view mode being set twice and cascading repeated logic
+    -- Validate mode
+    if not (mode == "VIEW" or mode == "CREATE" or mode == "IMPORT") then
+        return
+    end
+
+    if self.ViewMode:GetValue() == mode then
+        return
+    end
+
+    self.ViewMode:OnNext(mode)
+
+    -- REVIEW: reset buffers when switching modes?
+    if mode == "CREATE" then
+        -- self.NewPresetData:OnNext({ Name = "", Author = "", Version = "1.0" })
+    elseif mode == "IMPORT" then
+        -- self.ImportBuffer:OnNext("")
+    end
+end
+
+function State:OnCharacterChanged(entity)
+    if not entity or not entity.Uuid then return end
+
+    -- Avoid issues when switching characters back and forth
+    VCTimer:OnTicks(15, function()
+        self.TargetCharacterUUID = entity.Uuid.EntityUuid
+
+        self:ResetCopySources()
+        self:UpdateCapturedData()
+        self:UpdateFormDefaults()
+        self:UpdatePresetCompatibility()
+        self:RefreshUI()
+    end)
+end
+
+function State:RefreshPresets()
+    -- Get presets from registry
+    if PresetRegistry then
+        local recordsArray = PresetRegistry.GetAllAsArray()
+
+        -- Pass all records to the UI (including archived ones)
+        -- WindowHelpers will handle filtering them into categories
+        self.Presets:OnNext(recordsArray)
+
+        -- Count only visible presets for status message
+        local visibleCount = 0
+        for _, record in ipairs(recordsArray) do
+            if not (record.indexData and record.indexData.hidden) then
+                visibleCount = visibleCount + 1
+            end
+        end
+
+        self:SetStatus(Loca.FormatPlural(Loca.Keys.STATUS_FOUND_PRESETS_SINGULAR, Loca.Keys.STATUS_FOUND_PRESETS_PLURAL,
+            visibleCount))
+        CPFPrint(1, string.format("Refreshed UI with %d preset(s)", visibleCount))
+
+        -- Also update compatibility when refreshing presets
+        self:UpdatePresetCompatibility()
+    else
+        CPFWarn(0, "PresetRegistry not available")
+        self.Presets:OnNext({})
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_REGISTRY_NOT_AVAILABLE))
+    end
+end
+
+function State:SelectPreset(record)
+    self.SelectedPreset:OnNext(record)
+    if record and record.preset then
+        self:SetStatus(Loca.Format(Loca.Keys.STATUS_SELECTED_PRESET, record.preset.Name))
+    end
+    self:SetMode("VIEW")
+end
+
+function State:UpdateCapturedData()
+    if not self.TargetCharacterUUID then
+        self.TargetCharacterUUID = _C().Uuid.EntityUuid
+    end
+
+    local data = nil
+    if self.TargetCharacterUUID then
+        local character = Ext.Entity.Get(self.TargetCharacterUUID)
+        if character then
+            data = Preset.ExtractData(character, true)
+            self.CapturedData:OnNext(data)
+        end
+    end
+
+    -- Fallback to existing captured data if re-capture failed
+    if not data then
+        data = self.CapturedData:GetValue()
+    end
+
+    return data
+end
+
+--- Selects the controlled character, then adds the player's Dream Guardians when the server replies
+function State:ResetCopySources()
+    local character = _C()
+    local characterSource = { Name = "" }
+    if character and character.DisplayName then
+        characterSource.Name = Ext.Loca.GetTranslatedString(character.DisplayName.NameKey.Handle.Handle)
+    end
+
+    -- In Character Creation the name may still be empty
+    local characterTarget = { Name = characterSource.Name ~= "" and characterSource.Name or "Character", Target = "Character" }
+
+    self.SelectedCopySource = 1
+    self.CopySources:OnNext({ characterSource })
+    -- In Character Creation the guardian always exists as a definition, so offer it right away
+    local ccGuardianTarget = nil
+    if CCA.IsInCC() then
+        ccGuardianTarget = {
+            Name = Loca.Format(Loca.Keys.UI_SOURCE_DREAM_GUARDIAN, characterSource.Name,
+                Loca.Get(Loca.Keys.VANILLA_DREAM_GUARDIAN)),
+            Target = "DreamGuardian",
+        }
+    end
+
+    self.SelectedApplyTarget = 1
+    self.ApplyTargets:OnNext(ccGuardianTarget and { characterTarget, ccGuardianTarget } or { characterTarget })
+
+    local request = {
+        CharacterUuid = character and character.Uuid and character.Uuid.EntityUuid or nil,
+        InCC = CCA.IsInCC(),
+    }
+    NetChannels.RequestDreamGuardians:RequestToServer(request, function(response)
+        local sources = { characterSource }
+        local targets = { characterTarget }
+        for _, guardian in ipairs(response.Guardians or {}) do
+            local name = Loca.Format(Loca.Keys.UI_SOURCE_DREAM_GUARDIAN, guardian.AvatarName,
+                Loca.Get(Loca.Keys.VANILLA_DREAM_GUARDIAN))
+            if guardian.Data then
+                table.insert(sources, { Name = name, Data = guardian.Data })
+            end
+            table.insert(targets, {
+                Name = name,
+                Target = "DreamGuardian",
+                GuardianUuid = guardian.GuardianUuid,
+                Stats = guardian.Data and guardian.Data.CCStats or nil,
+            })
+        end
+        if #targets == 1 and ccGuardianTarget then
+            table.insert(targets, ccGuardianTarget)
+        end
+        self.CopySources:OnNext(sources)
+        self.ApplyTargets:OnNext(targets)
+        -- Re-render the selected preset so the "Apply to" combo appears
+        self.SelectedPreset:OnNext(self.SelectedPreset:GetValue())
+    end)
+end
+
+---@param index integer
+function State:SelectApplyTarget(index)
+    self.SelectedApplyTarget = index
+    local target = (self.ApplyTargets:GetValue() or {})[index]
+
+    -- Re-render so the compatibility warnings match the new target
+    self.SelectedPreset:OnNext(self.SelectedPreset:GetValue())
+
+    -- The guardian's race/body can change in Character Creation: refresh it, then re-check
+    if target and target.Target == "DreamGuardian" then
+        local character = _C()
+        NetChannels.RequestDreamGuardians:RequestToServer({
+            CharacterUuid = character and character.Uuid and character.Uuid.EntityUuid or nil,
+            InCC = CCA.IsInCC(),
+        }, function(response)
+            for _, guardian in ipairs(response.Guardians or {}) do
+                if guardian.GuardianUuid == target.GuardianUuid and guardian.Data then
+                    target.Stats = guardian.Data.CCStats
+                    break
+                end
+            end
+            if self.SelectedApplyTarget == index then
+                self.SelectedPreset:OnNext(self.SelectedPreset:GetValue())
+            end
+        end)
+    end
+end
+
+--- The currently selected apply target
+---@return ApplyTarget
+function State:GetApplyTarget()
+    local targets = self.ApplyTargets:GetValue() or {}
+    return targets[self.SelectedApplyTarget] or { Target = "Character" }
+end
+
+---@param index integer
+function State:SelectCopySource(index)
+    self.SelectedCopySource = index
+
+    local source = self.CopySources:GetValue()[index]
+    if source.Data then
+        self.CapturedData:OnNext(source.Data)
+    else
+        self:UpdateCapturedData()
+    end
+
+    local presetData = self.NewPresetData:GetValue()
+    presetData.Name = source.Name
+    self.NewPresetData:OnNext(presetData)
+end
+
+function State:UpdateFormDefaults()
+    -- Get the client player entity
+    if RequestUserInfo then
+        RequestUserInfo({
+            OnSuccess = function(response)
+                local data = self.NewPresetData:GetValue()
+                if response.UserName and response.UserName ~= "" then
+                    data.Author = response.UserName
+                end
+                local entity = _C()
+                if entity then
+                    data.Name = Ext.Loca.GetTranslatedString(entity.DisplayName.NameKey.Handle.Handle)
+                end
+
+                -- Trigger reactive update
+                self.NewPresetData:OnNext(data)
+                CPFPrint(1, string.format("Populated preset defaults: Author=%s, Name=%s",
+                    data.Author, data.Name))
+            end,
+            OnFailure = function(response)
+                CPFWarn(1, "Failed to retrieve user info from server")
+            end
+        })
+    end
+end
+
+function State:UpdatePresetCompatibility()
+    -- Trigger UI refresh by re-emitting presets
+    -- This ensures that the preset list in Window.lua re-renders and re-evaluates compatibility
+    self.Presets:OnNext(self.Presets:GetValue())
+end
+
+function State:RefreshUI()
+    local currentMode = self.ViewMode:GetValue()
+    self.ViewMode:OnNext(currentMode)
+end
+
+function State:CaptureCharacterData()
+    local function captureData(player)
+        if not player then
+            CPFWarn(0, "Could not find player entity")
+            self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_PLAYER_NOT_FOUND))
+            return
+        end
+
+        -- Store the target UUID for later use (saving)
+        if player.Uuid then
+            self.TargetCharacterUUID = player.Uuid.EntityUuid
+        end
+
+        -- Get the unified data (Stats + Appearance)
+        local unifiedData = Preset.ExtractData(player, true)
+
+        if not unifiedData or not unifiedData.CCAppearance then
+            CPFWarn(0, "Player entity does not have CharacterCreationAppearance component")
+            self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_CAPTURE_FAILED))
+            return
+        end
+
+        self.CapturedData:OnNext(unifiedData)
+
+
+        -- Get character name for display
+        local displayName = ""
+        if player.DisplayName and player.DisplayName.NameKey then
+            displayName = Ext.Loca.GetTranslatedString(player.DisplayName.NameKey.Handle.Handle)
+        end
+
+        self:SetMode("CREATE")
+        self:SetStatus(Loca.Format(Loca.Keys.STATUS_CAPTURED_DATA, displayName))
+        CPFPrint(1, "Successfully captured CCA data from player")
+    end
+
+    -- Get the client player entity
+    if RequestUserInfo then
+        RequestUserInfo({
+            OnSuccess = function(response)
+                local character = _C()
+                local data = self.NewPresetData:GetValue()
+                if response.UserName and response.UserName ~= "" then
+                    data.Author = response.UserName
+                end
+                if character and character.DisplayName then
+                    data.Name = Ext.Loca.GetTranslatedString(character.DisplayName.NameKey.Handle.Handle)
+                end
+
+                self:ResetCopySources()
+                captureData(character)
+                -- Trigger reactive update
+                self.NewPresetData:OnNext(data)
+                CPFPrint(1, string.format("Populated preset defaults: Author=%s, Name=%s",
+                    data.Author, data.Name))
+            end,
+            OnFailure = function(response)
+                CPFWarn(1, "Failed to retrieve user info from server")
+            end
+        })
+    end
+end
+
+function State:SaveNewPreset()
+    local source = self.CopySources:GetValue()[self.SelectedCopySource]
+    -- Re-capture the character on save to ensure its data is up-to-date
+    local data = source.Data or self:UpdateCapturedData()
+
+    if not data then
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_NO_DATA_TO_SAVE))
+        return
+    end
+
+    local presetData = self.NewPresetData:GetValue()
+    local name = presetData.Name
+    if name == "" then
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_NAME_REQUIRED))
+        return
+    end
+
+    -- Use global Preset module
+    if not (Preset and Preset.Create) then
+        CPFWarn(0, "Preset module not loaded")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_PRESET_MODULE_NOT_LOADED))
+        return
+    end
+
+    local newPreset = Preset.Create(name, presetData.Author, presetData.Version, data)
+    if not newPreset then
+        CPFWarn(0, "Failed to create preset object")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_CREATING_PRESET))
+        return
+    end
+
+    -- Get target entity for portrait generation; a guardian preset must not get the character's portrait
+    local targetEntity = nil
+    if self.TargetCharacterUUID and not source.Data then
+        targetEntity = Ext.Entity.Get(self.TargetCharacterUUID)
+    end
+
+    -- Use Preset module to orchestrate the complete save workflow
+    if not (Preset and Preset.SaveUserPreset) then
+        CPFWarn(0, "Preset.SaveUserPreset not available")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_PRESET_MODULE_NOT_LOADED))
+        return
+    end
+
+    local success, err = Preset.SaveUserPreset(newPreset, targetEntity)
+    if not success then
+        CPFWarn(1, "Failed to save preset: " .. tostring(err))
+        self:SetStatus(Loca.Format(Loca.Keys.STATUS_ERROR_REGISTER_PRESET, tostring(err)))
+        return
+    end
+
+    self:SetStatus(Loca.Format(Loca.Keys.STATUS_PRESET_SAVED, name))
+    self:RefreshPresets()
+
+    -- Select the new preset (need to fetch the record)
+    local record = PresetRegistry.Get(newPreset._id)
+    if record then
+        self:SelectPreset(record)
+    end
+end
+
+--- Mark a preset as archived
+---@param record PresetRecord
+function State:ArchivePreset(record)
+    if not record or not record.preset then return end
+
+    if not (PresetManager and PresetManager.ArchivePreset) then
+        CPFWarn(0, "PresetManager not available")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_DISCOVERY_NOT_AVAILABLE))
+        return
+    end
+
+    local success, err = PresetManager.ArchivePreset(record.preset._id)
+    if not success then
+        CPFWarn(0, "Failed to archive preset: " .. tostring(err))
+        self:SetStatus(Loca.Format(Loca.Keys.STATUS_ERROR_ARCHIVE_PRESET, tostring(err)))
+        return
+    end
+
+    self:SetStatus(Loca.Format(Loca.Keys.STATUS_PRESET_ARCHIVED, record.preset.Name))
+    self:RefreshPresets()
+    self.SelectedPreset:OnNext(nil)
+end
+
+--- Mark a preset as unarchived
+---@param record PresetRecord
+function State:UnarchivePreset(record)
+    if not record or not record.preset then return end
+
+    if not (PresetManager and PresetManager.UnarchivePreset) then
+        CPFWarn(0, "PresetManager not available")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_DISCOVERY_NOT_AVAILABLE))
+        return
+    end
+
+    local success, err = PresetManager.UnarchivePreset(record.preset._id)
+    if not success then
+        CPFWarn(0, "Failed to unarchive preset: " .. tostring(err))
+        self:SetStatus(Loca.Format(Loca.Keys.STATUS_ERROR_UNARCHIVE_PRESET, tostring(err)))
+        return
+    end
+    self:SetStatus(Loca.Format(Loca.Keys.STATUS_PRESET_UNARCHIVED, record.preset.Name))
+    self:RefreshPresets()
+    -- Keep the preset selected after unarchiving
+    -- We need to get the updated record from the registry
+    local updatedRecord = PresetRegistry.Get(record.preset._id)
+    if updatedRecord then
+        self.SelectedPreset:OnNext(updatedRecord)
+    end
+end
+
+--- Delete an archived user preset from the index and clear its file
+---@param record PresetRecord
+function State:DeletePreset(record)
+    if not record or not record.preset then return end
+
+    if not (PresetManager and PresetManager.DeletePreset) then
+        CPFWarn(0, "PresetManager not available")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_DISCOVERY_NOT_AVAILABLE))
+        return
+    end
+
+    local success, err = PresetManager.DeletePreset(record.preset._id)
+    if not success then
+        CPFWarn(0, "Failed to delete preset: " .. tostring(err))
+        self:SetStatus(Loca.Format(Loca.Keys.STATUS_ERROR_DELETE_PRESET, tostring(err)))
+        return
+    end
+
+    self:SetStatus(Loca.Format(Loca.Keys.STATUS_PRESET_DELETED, record.preset.Name))
+    self:RefreshPresets()
+    self.SelectedPreset:OnNext(nil)
+end
+
+function State:ApplyPreset(record)
+    if not record or not record.preset then return end
+    local preset = record.preset
+
+    if not RequestApplyPreset then
+        CPFWarn(0, "RequestApplyPreset not available")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_APPLY_NOT_AVAILABLE))
+        return
+    end
+
+    -- Get the client player entity
+    local player = _C()
+
+    if not player then
+        CPFWarn(0, "Could not find player entity")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_PLAYER_NOT_FOUND))
+        return
+    end
+
+    -- Get the player's UUID
+    local playerUuid = player.Uuid.EntityUuid
+    if not playerUuid then
+        CPFWarn(0, "Could not get player UUID")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_PLAYER_UUID_NOT_FOUND))
+        return
+    end
+
+    local targets = self.ApplyTargets:GetValue() or {}
+    local target = targets[self.SelectedApplyTarget] or { Target = "Character" }
+
+    -- Diagnostics: record what the client sees on every apply, whichever path the server takes
+    if CCDebug then
+        local levelName = nil
+        pcall(function() levelName = player.Level.LevelName end)
+        CCDebug.Dump(player, "client apply click", {
+            levelName = levelName,
+            inCC = CCA.IsInCC(),
+            target = target,
+            targetCount = #targets,
+        })
+    end
+
+    -- Send request to server to apply preset
+    RequestApplyPreset(playerUuid, preset, {
+        Target = target.Target,
+        GuardianUuid = target.GuardianUuid,
+        InCC = CCA.IsInCC(),
+        OnSuccess = function(response)
+            if response.Warnings and #response.Warnings > 0 then
+                self:SetStatus(Loca.Format(Loca.Keys.STATUS_APPLIED_PRESET_WITH_WARNINGS, preset.Name,
+                    table.concat(response.Warnings, "; ")))
+            else
+                self:SetStatus(Loca.Format(Loca.Keys.STATUS_APPLIED_PRESET, preset.Name))
+            end
+            CPFPrint(1, "Successfully applied preset: " .. preset.Name)
+        end,
+        OnFailure = function(warnings, response)
+            if warnings and #warnings > 0 then
+                self:SetStatus(Loca.Format(Loca.Keys.STATUS_FAILED_APPLY_PRESET_WITH_WARNINGS,
+                    table.concat(warnings, "; ")))
+            else
+                self:SetStatus(Loca.Get(Loca.Keys.STATUS_FAILED_APPLY_PRESET))
+            end
+            CPFWarn(0, "Failed to apply preset: " .. preset.Name)
+        end
+    })
+end
+
+function State:ImportFromBuffer()
+    if self.ImportBuffer:GetValue() == "" then
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_IMPORT_EMPTY))
+        return
+    end
+
+    if not Preset or not Preset.Deserialize then
+        CPFWarn(0, "Preset module not loaded")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_PRESET_MODULE_NOT_LOADED))
+        return
+    end
+
+    local success, presetOrError, presetDeserializeError = xpcall(
+        function()
+            return Preset.Deserialize(self.ImportBuffer:GetValue())
+        end,
+        function(err)
+            return debug.traceback(tostring(err), 2)
+        end
+    )
+
+    if not success then
+        CPFWarn(0, "Import failed: " .. tostring(presetOrError))
+        self:SetStatus(Loca.Format(Loca.Keys.STATUS_IMPORT_ERROR, tostring(presetOrError)))
+        return
+    end
+
+    -- Handle xpcall result (first return is success boolean)
+    if not presetOrError then
+        local errorMessage = Preset.GetErrorMessage(presetDeserializeError)
+        CPFWarn(0, "Failed to parse/validate import buffer: " .. errorMessage)
+        self:SetStatus(Loca.Format(Loca.Keys.STATUS_IMPORT_ERROR, errorMessage))
+        return
+    end
+
+    -- Deserialize returns (preset, err), so we need to check the actual result
+    local actualPreset, validationErr = presetOrError, presetDeserializeError
+    if not actualPreset then
+        local errorMessage = Preset.GetErrorMessage(validationErr)
+        CPFWarn(0, "Failed to deserialize import buffer: " .. errorMessage)
+        self:SetStatus(Loca.Format(Loca.Keys.STATUS_IMPORT_ERROR, errorMessage))
+        return
+    end
+
+    -- Use PresetManager to register (handles both registry and index)
+    if not (PresetManager and PresetManager.SaveUserPreset) then
+        CPFWarn(0, "PresetManager not available")
+        self:SetStatus(Loca.Get(Loca.Keys.STATUS_ERROR_DISCOVERY_NOT_AVAILABLE))
+        return
+    end
+
+    local registrationSuccess, err = PresetManager.SaveUserPreset(actualPreset)
+    if not registrationSuccess then
+        CPFWarn(0, "Failed to register imported preset: " .. tostring(err))
+        self:SetStatus(Loca.Format(Loca.Keys.STATUS_IMPORT_ERROR, tostring(err)))
+        return
+    end
+
+    -- Unarchive preset just in case
+    PresetIndex.SetArchived(actualPreset._id, false)
+    self.ImportBuffer:OnNext("")
+    self:SetStatus(Loca.Format(Loca.Keys.STATUS_IMPORTED_PRESET, actualPreset.Name))
+    self:RefreshPresets()
+
+    local record = PresetRegistry.Get(actualPreset._id)
+    if record then
+        self:SelectPreset(record)
+    end
+end
+
+return State

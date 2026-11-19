@@ -1,0 +1,18 @@
+RequireFiles("Shared/Helpers/", {
+    "Constants",
+    "VC/_Init",
+    "Enums/_Init",
+    "PresetCompat",
+    "ModValidation",
+    "Table",
+    "Printer",
+    "UserData",
+    "CCA",
+    "CCApplier",
+    "CCDebug",
+    "JsonLayer",
+    "UserID",
+    "ValueSerializer",
+    "LocalizationManager",
+    "ResourceHelper",
+})

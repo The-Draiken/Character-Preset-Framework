@@ -1,0 +1,315 @@
+local State = Ext.Require("Client/UI/State.lua")
+local MessageBox = Ext.Require("Client/UI/Components/MessageBox.lua")
+local PresetInspector = Ext.Require("Shared/Presets/PresetInspector.lua")
+local PresetCompatibility = Ext.Require("Shared/Validation/PresetCompatibility.lua")
+local ResourceHelper = Ext.Require("Shared/Helpers/ResourceHelper.lua")
+
+local ViewModeHelpers = {}
+
+-- Configuration
+local ATTRIBUTE_KEYS = {
+    { key = "Visuals",   locaKey = "UI_HEADER_VISUALS" },
+    { key = "EyeColor",  locaKey = "RESOURCE_EYE_COLOUR" },
+    { key = "HairColor", locaKey = "RESOURCE_HAIR_COLOUR" },
+    { key = "SkinColor", locaKey = "RESOURCE_SKIN_COLOR" },
+    { key = "Elements",  locaKey = "RESOURCE_MATERIAL_OVERRIDE" },
+}
+
+-- Format mod resources with filtering
+local function _FormatModResources(resources)
+    if not resources then return "" end
+
+    local parts = {}
+    for _, resource in ipairs(resources) do
+        table.insert(parts, string.format("%s (%s)", resource.DisplayName, resource.SlotName))
+    end
+
+    return table.concat(parts, "\n\t")
+end
+
+-- Format single mod line
+local function _FormatModLine(mod)
+    local resourcesText = _FormatModResources(mod.Resources)
+    if resourcesText == "" then return nil end
+    resourcesText = ResourceHelper:CleanDisplayName(resourcesText)
+
+    local prefix = mod.IsLoaded and "" or Loca.Get(Loca.Keys.UI_MISSING_MOD) .. " "
+    return string.format("%s%s: %s", prefix, mod.Name, resourcesText)
+end
+
+-- Collect all warnings
+local function _CollectWarnings(compatibilityInfo)
+    local allWarnings = {}
+
+    for _, mod in ipairs(compatibilityInfo.AllMods) do
+        if not mod.IsLoaded then
+            table.insert(allWarnings, Loca.Format(
+                Loca.Keys.UI_WARN_MISSING_MOD,
+                mod.Name,
+                mod.UUID
+            ))
+        end
+    end
+
+    for _, warning in ipairs(compatibilityInfo.Warnings) do
+        table.insert(allWarnings, warning)
+    end
+
+    return allWarnings
+end
+
+-- Show apply confirmation
+local function _ShowApplyConfirmation(group, record, warnings)
+    if #warnings == 0 then
+        State:ApplyPreset(record)
+        return
+    end
+
+    local msg = Loca.Format(
+        Loca.Keys.UI_MSG_COMPATIBILITY_WARNING,
+        table.concat(warnings, "\n- ")
+    )
+
+    MessageBox:Create(
+        Loca.Get(Loca.Keys.UI_TITLE_COMPATIBILITY_WARNING),
+        msg,
+        MessageBoxMode.YesNo
+    )
+        :SetYesCallback(function() State:ApplyPreset(record) end)
+        :Show(group)
+end
+
+--- Show delete confirmation for an archived preset
+---@param group ExtuiGroup
+---@param record PresetRecord
+local function _ShowDeleteConfirmation(group, record)
+    MessageBox:Create(
+        Loca.Get(Loca.Keys.UI_TITLE_DELETE_PRESET),
+        Loca.Format(Loca.Keys.UI_MSG_DELETE_PRESET_CONFIRM, record.preset.Name),
+        MessageBoxMode.YesNo
+    )
+        :SetYesCallback(function() State:DeletePreset(record) end)
+        :Show(group)
+end
+
+-- Render the "Apply to" combo (player character or Dream Guardian)
+local function _RenderApplyTargetCombo(group)
+    local targets = State.ApplyTargets:GetValue() or {}
+    if #targets == 0 then
+        -- Nothing loaded yet (no character-change event fired, e.g. in Character Creation)
+        State:ResetCopySources()
+        targets = State.ApplyTargets:GetValue() or {}
+    end
+    if #targets < 2 then
+        State.SelectedApplyTarget = 1
+        return
+    end
+    if State.SelectedApplyTarget > #targets then
+        State.SelectedApplyTarget = 1
+    end
+
+    local labelText = group:AddText(Loca.Get(Loca.Keys.UI_LABEL_APPLY_TO))
+    labelText.TextWrapPos = 0
+
+    local options = {}
+    for i, target in ipairs(targets) do
+        options[i] = target.Name
+    end
+
+    local combo = group:AddCombo("")
+    combo.SameLine = true
+    combo.Options = options
+    combo.SelectedIndex = State.SelectedApplyTarget - 1
+    combo.OnChange = function()
+        State:SelectApplyTarget(combo.SelectedIndex + 1)
+    end
+end
+
+-- Create active apply button
+local function _CreateApplyButton(group, record, compatibilityInfo)
+    local btnApply = group:AddButton(Loca.Get(Loca.Keys.UI_BUTTON_APPLY))
+    btnApply:SetColor("Button", UIColors.COLOR_GREEN)
+    btnApply.OnClick = function()
+        local warnings = _CollectWarnings(compatibilityInfo)
+        _ShowApplyConfirmation(group, record, warnings)
+    end
+    return btnApply
+end
+
+-- Render inspected value
+local function _RenderInspectedValue(attrChild, label, inspected)
+    if type(inspected) == "table" then
+        if #inspected > 0 then
+            local labelText = attrChild:AddText(label .. ":")
+            labelText.TextWrapPos = 0
+            for _, line in ipairs(inspected) do
+                local lineText = attrChild:AddText("  - " .. line)
+                lineText.TextWrapPos = 0
+            end
+        end
+    else
+        if inspected ~= "" and not string.find(inspected, "Unknown") then
+            local inspectedText = attrChild:AddText(string.format("%s: %s", label, inspected))
+            inspectedText.TextWrapPos = 0
+        end
+    end
+end
+
+function ViewModeHelpers.GetCompatibilityInfo(preset)
+    local warnings = {}
+    local allMods = {}
+    local missingMods = {}
+    local player = _C()
+
+    local target = State:GetApplyTarget()
+    if PresetCompatibility and target.Target == "DreamGuardian" then
+        -- Compare against the Dream Guardian, not the player character
+        warnings = PresetCompatibility.CheckStats(preset.Data and preset.Data.CCStats, target.Stats)
+        allMods = Preset.GetMods(preset)
+        missingMods = PresetCompatibility.CheckMods(preset)
+    elseif PresetCompatibility and player then
+        warnings = PresetCompatibility.Check(preset, player)
+        allMods = Preset.GetMods(preset)
+        missingMods = PresetCompatibility.CheckMods(preset)
+    end
+
+    return {
+        Warnings = warnings,
+        AllMods = allMods,
+        MissingMods = missingMods,
+    }
+end
+
+function ViewModeHelpers.RenderHeader(group, record)
+    if not record or not record.preset then
+        return CPFWarn(0, "ViewModeHelpers.RenderHeader: record or record.preset is nil")
+    end
+
+    local preset = record.preset
+    local nameText = group:AddText(Loca.Format(Loca.Keys.UI_LABEL_NAME_VALUE, preset.Name or "Unknown"))
+    nameText.TextWrapPos = 0
+    if record.indexData.source and string.lower(record.indexData.source) ~= 'user' then
+        local sourceText = group:AddText(Loca.Format(Loca.Keys.UI_LABEL_SOURCE_VALUE, record.indexData.source))
+        sourceText.TextWrapPos = 0
+    end
+    local authorText = group:AddText(Loca.Format(Loca.Keys.UI_LABEL_AUTHOR_VALUE, preset.Author or "Unknown"))
+    authorText.TextWrapPos = 0
+    local versionText = group:AddText(Loca.Format(Loca.Keys.UI_LABEL_VERSION_VALUE, preset.Version or "Unknown"))
+    versionText:SetColor("Text", UIColors.COLOR_GRAY)
+    versionText.TextWrapPos = 0
+
+    local IDText = group:AddText(Loca.Format(Loca.Keys.UI_LABEL_ID_VALUE, preset._id or "Unknown"))
+    IDText:SetColor("Text", UIColors.COLOR_GRAY)
+    IDText.TextWrapPos = 0
+
+    group:AddSeparator()
+end
+
+function ViewModeHelpers.RenderActions(group, record, compatibilityInfo)
+    _RenderApplyTargetCombo(group)
+    local btnApply = _CreateApplyButton(group, record, compatibilityInfo)
+
+    btnApply.SameLine = false
+
+    local buttonSpacing = group:AddSpacing()
+    buttonSpacing.SameLine = true
+
+    local isArchived = record.indexData and record.indexData.hidden
+
+    if isArchived then
+        -- Show unarchive button for archived presets
+        local btnUnarchive = group:AddButton(Loca.Get(Loca.Keys.UI_BUTTON_UNARCHIVE_PRESET))
+        btnUnarchive.OnClick = function()
+            State:UnarchivePreset(record)
+        end
+        btnUnarchive.SameLine = true
+
+        local isUserPreset = record.indexData
+            and string.lower(record.indexData.source or "") == "user"
+            and record.indexData.filename
+            and record.indexData.filename ~= ""
+
+        if isUserPreset then
+            local btnDelete = group:AddButton(Loca.Get(Loca.Keys.UI_BUTTON_DELETE_PRESET))
+            btnDelete:SetColor("Button", UIColors.COLOR_RED)
+            btnDelete.OnClick = function()
+                _ShowDeleteConfirmation(group, record)
+            end
+            btnDelete.SameLine = true
+        end
+    else
+        -- Show Archive button for visible presets
+        local btnArchive = group:AddButton(Loca.Get(Loca.Keys.UI_BUTTON_ARCHIVE_PRESET))
+        btnArchive:SetColor("Button", UIColors.COLOR_RED)
+        btnArchive.OnClick = function()
+            State:ArchivePreset(record)
+        end
+        btnArchive.SameLine = true
+    end
+
+    group:AddSeparator()
+end
+
+function ViewModeHelpers.RenderModList(group, compatibilityInfo)
+    local allMods = compatibilityInfo.AllMods
+    if #allMods == 0 then return end
+
+    local modLines = {}
+    for _, mod in ipairs(allMods) do
+        local line = _FormatModLine(mod)
+        if line then
+            table.insert(modLines, line)
+        end
+    end
+
+    if #modLines == 0 then return end
+
+    local modsText = group:AddBulletText(Loca.Format(
+        Loca.Keys.UI_HEADER_MODS_USED,
+        table.concat(modLines, "\n")
+    ))
+    modsText.TextWrapPos = -1
+
+    if #compatibilityInfo.MissingMods > 0 then
+        modsText:SetColor("Text", UIColors.COLOR_RED)
+    end
+end
+
+function ViewModeHelpers.RenderWarnings(group, compatibilityInfo)
+    local warnings = compatibilityInfo.Warnings
+    if #warnings == 0 then return end
+
+    local compatibilityWarning = group:AddBulletText(Loca.Format(
+        Loca.Keys.UI_HEADER_COMPATIBILITY_WARNINGS,
+        table.concat(warnings, "\n")
+    ))
+    compatibilityWarning:SetColor("Text", UIColors.COLOR_ORANGE)
+    compatibilityWarning.TextWrapPos = -1
+end
+
+function ViewModeHelpers.RenderAttributes(group, preset)
+    local attrChild = group:AddChildWindow("AttributesView")
+    local appearanceData = preset.Data and preset.Data.CCAppearance
+
+    if not appearanceData then
+        local noDataText = attrChild:AddText(Loca.Get(Loca.Keys.UI_MSG_NO_DATA_AVAILABLE))
+        noDataText.TextWrapPos = 0
+        return
+    end
+
+    for _, config in ipairs(ATTRIBUTE_KEYS) do
+        local value = appearanceData[config.key]
+        if value then
+            local inspected = PresetInspector:Inspect(config.key, value)
+            if inspected then
+                local label = Loca.Get(Loca.Keys[config.locaKey])
+                if label == "[NO LOCA " .. tostring(Loca.Keys[config.locaKey]) .. "]" then
+                    label = config.key
+                end
+                _RenderInspectedValue(attrChild, label, inspected)
+            end
+        end
+    end
+end
+
+return ViewModeHelpers
